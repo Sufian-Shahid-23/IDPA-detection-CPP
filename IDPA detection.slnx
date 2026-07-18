@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="IDPA detection/IDPA detection.vcxproj" Id="34335366-5fb3-41f4-9eba-f0b3a4acc319" />
+</Solution>
