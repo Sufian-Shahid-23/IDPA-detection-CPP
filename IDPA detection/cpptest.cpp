@@ -62,6 +62,484 @@ double signedArea(const Contour& c)
     return a / 2.0;
 }
 
+Contour removeBulletHoles(const Contour& input,
+    const std::vector<bool>& protected_,
+    double maxHoleWidth = 50.0,
+    double minHoleDepth = 0.5,
+    int    windowSize = 8)
+{
+    int n = (int)input.size();
+    if (n < 24) return input;
+
+    cv::Point2d C(0, 0);
+    for (auto& p : input) { C.x += p.x; C.y += p.y; }
+    C.x /= n; C.y /= n;
+
+    std::vector<double> depth(n, 0.0);
+    std::vector<bool>   concave(n, false);
+
+    for (int i = 0; i < n; i++)
+    {
+        int iPrev = (i - windowSize + n) % n;
+        int iNext = (i + windowSize) % n;
+
+        cv::Point2d prev(input[iPrev].x, input[iPrev].y);
+        cv::Point2d curr(input[i].x, input[i].y);
+        cv::Point2d next(input[iNext].x, input[iNext].y);
+
+        double chordX = next.x - prev.x;
+        double chordY = next.y - prev.y;
+        double chordLen = std::hypot(chordX, chordY);
+        if (chordLen < 1e-6) continue;
+
+        // Perpendicular to chord
+        double nx = -chordY / chordLen;
+        double ny = chordX / chordLen;
+
+        double midX = (prev.x + next.x) * 0.5;
+        double midY = (prev.y + next.y) * 0.5;
+        double d = (curr.x - midX) * nx + (curr.y - midY) * ny;
+
+        // Positive cross = left of travel = concave for CW contour
+        // Negative cross = right of travel = convex for CW contour
+        double travelX = next.x - prev.x;
+        double travelY = next.y - prev.y;
+        double toX = curr.x - prev.x;
+        double toY = curr.y - prev.y;
+        double cross = travelX * toY - travelY * toX;
+
+        depth[i] = std::abs(d);
+        // For OpenCV contours (typically CW): 
+        // cross < 0 means point bulges to the right of travel = outward spike
+        // cross > 0 means point bulges to the left of travel = inward dent
+        // We want to remove BOTH so just use depth regardless of sign
+        concave[i] = (cross > 0);  // still tracked but no longer used as filter
+    }
+    std::vector<bool> remove(n, false);
+    //step 2
+    for (int i = 0; i < n; i++)
+    {
+        if (depth[i] < minHoleDepth) continue;
+        if (remove[i]) continue;
+        if (protected_[i]) continue;  
+
+        double peakDepth = depth[i];
+        int leftEdge = i;
+        int rightEdge = i;
+
+        for (int k = 1; k < windowSize * 3; k++)
+        {
+            int iTest = (i - k + n) % n;
+            if (depth[iTest] < peakDepth * 0.50 || protected_[iTest])
+            {
+                leftEdge = iTest;
+                break;
+            }
+            leftEdge = iTest;
+        }
+        for (int k = 1; k < windowSize * 3; k++)
+        {
+            int iTest = (i + k) % n;
+            if (depth[iTest] < peakDepth * 0.50 || protected_[iTest])
+            {
+                rightEdge = iTest;
+                break;
+            }
+            rightEdge = iTest;
+        }
+
+        cv::Point2d pL(input[leftEdge].x, input[leftEdge].y);
+        cv::Point2d pR(input[rightEdge].x, input[rightEdge].y);
+        double holeWidth = std::hypot(pR.x - pL.x, pR.y - pL.y);
+        int spanPoints = (rightEdge - leftEdge + n) % n;
+
+        if (protected_[i]) continue;
+        if (spanPoints < 10) continue;
+        if (holeWidth > maxHoleWidth) continue;
+
+        int idx = (leftEdge + 1) % n;
+        int safety = 0;
+        while (idx != rightEdge && safety++ < n)
+        {
+            if (!protected_[idx])  
+                remove[idx] = true;
+            idx = (idx + 1) % n;
+        }
+    
+    }
+
+    Contour result;
+    result.reserve(n);
+    for (int i = 0; i < n; i++)
+        if (!remove[i])
+            result.push_back(input[i]);
+
+    return result.empty() ? input : result;
+}
+
+
+
+Contour densifyContour(const Contour& cnt, double maxSpacing = 2.0)
+{
+    Contour dense;
+    int n = (int)cnt.size();
+    for (int i = 0; i < n; i++)
+    {
+        cv::Point2d p1(cnt[i].x, cnt[i].y);
+        cv::Point2d p2(cnt[(i + 1) % n].x, cnt[(i + 1) % n].y);
+        dense.push_back(cnt[i]);
+
+        double dist = std::hypot(p2.x - p1.x, p2.y - p1.y);
+        int steps = (int)(dist / maxSpacing);
+        for (int s = 1; s < steps; s++)
+        {
+            double t = (double)s / steps;
+            dense.push_back(cv::Point(
+                (int)std::round(p1.x + t * (p2.x - p1.x)),
+                (int)std::round(p1.y + t * (p2.y - p1.y))
+            ));
+        }
+    }
+    return dense;
+}
+
+std::pair<std::vector<cv::Point2d>, bool> findTrueCorners(
+    const Contour& dense,
+    bool isOctagon,
+    double protectRadius = 50.0)
+{
+    std::vector<cv::Point2d> corners;
+
+    if (isOctagon)
+    {
+        // Precompute centroid for outward normal direction
+        cv::Point2d centroid(0, 0);
+        for (auto& dp : dense) { centroid.x += dp.x; centroid.y += dp.y; }
+        centroid.x /= (double)dense.size();
+        centroid.y /= (double)dense.size();
+
+        Contour ch;
+        cv::convexHull(dense, ch);
+        double hull_perim = cv::arcLength(ch, true);
+
+        Contour best_approx;
+        int best_diff = 9999;
+        for (double ef = 0.005; ef <= 0.04; ef += 0.002)
+        {
+            Contour trial;
+            cv::approxPolyDP(ch, trial, ef * hull_perim, true);
+            int diff = std::abs((int)trial.size() - 8);
+            if (diff < best_diff)
+            {
+                best_diff = diff;
+                best_approx = trial;
+            }
+            if (best_diff == 0) break;
+        }
+
+        // Signed area helper
+        auto signed_area = [](const Contour& poly) -> double
+            {
+                double a = 0;
+                int n = (int)poly.size();
+                for (int i = 0; i < n; i++)
+                {
+                    const cv::Point& p1 = poly[i];
+                    const cv::Point& p2 = poly[(i + 1) % n];
+                    a += (double)p1.x * p2.y - (double)p2.x * p1.y;
+                }
+                return a * 0.5;
+            };
+
+
+        Contour approx = best_approx;
+        bool changed = true;
+        while (changed && (int)approx.size() > 8)
+        {
+            changed = false;
+            int sz = (int)approx.size();
+            double perim_now = cv::arcLength(approx, true);
+            double side_thresh = perim_now * 0.12;
+            double base_area = std::abs(signed_area(approx));
+            int worst_idx = -1;
+            double worst_score = -1.0;
+
+            for (int i = 0; i < sz; i++)
+            {
+                cv::Point2f pc = approx[i];
+                cv::Point2f pp = approx[(i - 1 + sz) % sz];
+                cv::Point2f pn = approx[(i + 1) % sz];
+                double lp = std::hypot(pc.x - pp.x, pc.y - pp.y);
+                double ln = std::hypot(pc.x - pn.x, pc.y - pn.y);
+                if (lp >= side_thresh || ln >= side_thresh) continue;
+                Contour trial = approx;
+                trial.erase(trial.begin() + i);
+                double trial_area = std::abs(signed_area(trial));
+                if (trial_area < base_area * 0.998) continue;
+                double score = 1.0 / (lp + ln + 1e-6);
+                if (score > worst_score)
+                {
+                    worst_score = score;
+                    worst_idx = i;
+                }
+            }
+            if (worst_idx >= 0) { approx.erase(approx.begin() + worst_idx); changed = true; }
+        }
+
+        if ((int)approx.size() < 6)
+            cv::approxPolyDP(ch, approx, 0.015 * hull_perim, true);
+
+
+        // ── NOW upgrade each rough corner to precise intersection ──────
+        // This fixes the bullet-hole-at-corner problem:
+        // The hull corner is pulled toward the bullet hole,
+        // but the fitted lines through the full edges are not affected.
+        int m = (int)approx.size();
+        for (int i = 0; i < m; i++)
+        {
+            cv::Point2f p0 = approx[(i - 1 + m) % m];
+            cv::Point2f p1 = approx[i];
+            cv::Point2f p2 = approx[(i + 1) % m];
+
+            // Collect dense points near edge (p0→p1)
+            auto collectEdgePts = [&](cv::Point2f ea, cv::Point2f eb)
+                -> std::vector<cv::Point2f>
+                {
+                    std::vector<cv::Point2f> pts;
+                    double elen = std::hypot(eb.x - ea.x, eb.y - ea.y);
+                    if (elen < 1e-6) return pts;
+                    double edx = (eb.x - ea.x) / elen, edy = (eb.y - ea.y) / elen;
+                    double nx = -edy, ny = edx;
+                    for (auto& dp : dense)
+                    {
+                        double tx = dp.x - ea.x, ty = dp.y - ea.y;
+                        double perp = std::abs(tx * nx + ty * ny);
+                        double proj = tx * edx + ty * edy;
+                        if (perp < 18.0 && proj > -20.0 && proj < elen + 20.0)
+                            pts.push_back(cv::Point2f(dp.x, dp.y));
+                    }
+                    return pts;
+                };
+
+            auto fitEdgeLine = [&](cv::Point2f ea, cv::Point2f eb,
+                double& ax, double& ay,
+                double& dx, double& dy) -> bool
+                {
+                    auto pts = collectEdgePts(ea, eb);
+                    if ((int)pts.size() < 6)
+                    {
+                        double elen = std::hypot(eb.x - ea.x, eb.y - ea.y) + 1e-9;
+                        ax = ea.x; ay = ea.y;
+                        dx = (eb.x - ea.x) / elen; dy = (eb.y - ea.y) / elen;
+                        return false;
+                    }
+                    cv::Vec4f lp;
+                    cv::fitLine(pts, lp, cv::DIST_L2, 0, 0.01, 0.01);
+                    ax = lp[2]; ay = lp[3]; dx = lp[0]; dy = lp[1];
+                    return true;
+                };
+            // Fit lines for the two edges meeting at this corner
+            double ax1, ay1, dx1, dy1, ax2, ay2, dx2, dy2;
+            fitEdgeLine(p0, p1, ax1, ay1, dx1, dy1);
+            fitEdgeLine(p1, p2, ax2, ay2, dx2, dy2);
+
+            // Intersect the two fitted lines
+            double ddx = ax2 - ax1, ddy = ay2 - ay1;
+            double denom = dx1 * dy2 - dy1 * dx2;
+
+            if (std::abs(denom) < 1e-9)
+            {
+                // Parallel — keep original rough corner
+                corners.push_back({ p1.x, p1.y });
+            }
+            else
+            {
+                double t = (ddx * dy2 - ddy * dx2) / denom;
+                corners.push_back({ ax1 + t * dx1, ay1 + t * dy1 });
+            }
+        }
+        return { corners, false }; // octagon never measures straightness
+    }
+    else
+    {
+        // ── TORSO: convex corners via hull + neck corners via defects ──
+
+        // Part 1: 10 convex corners same sweep approach
+        Contour hull;
+        cv::convexHull(dense, hull);
+        double hullP = cv::arcLength(hull, true);
+
+        Contour best;
+        int bestDiff = 9999;
+        for (double ef = 0.01; ef <= 0.12; ef += 0.001)
+        {
+            Contour trial;
+            cv::approxPolyDP(hull, trial, ef * hullP, true);
+            int diff = std::abs((int)trial.size() - 10);
+            if (diff < bestDiff) { bestDiff = diff; best = trial; }
+            if (bestDiff == 0) break;
+        }
+
+        // Upgrade each rough torso corner to precise intersection
+        int m = (int)best.size();
+        for (int i = 0; i < m; i++)
+        {
+            cv::Point2f p0 = best[(i - 1 + m) % m];
+            cv::Point2f p1 = best[i];
+            cv::Point2f p2 = best[(i + 1) % m];
+
+            auto collectEdgePts = [&](cv::Point2f ea, cv::Point2f eb)
+                -> std::vector<cv::Point2f>
+                {
+                    std::vector<cv::Point2f> pts;
+                    double elen = std::hypot(eb.x - ea.x, eb.y - ea.y);
+                    if (elen < 1e-6) return pts;
+                    double edx = (eb.x - ea.x) / elen, edy = (eb.y - ea.y) / elen;
+                    double nx = -edy, ny = edx;
+
+                    // Compute centroid of dense contour to know which way is "inward"
+                    cv::Point2d centroid(0, 0);
+                    for (auto& dp : dense) { centroid.x += dp.x; centroid.y += dp.y; }
+                    centroid.x /= dense.size(); centroid.y /= dense.size();
+
+                    // Mid-point of this edge
+                    cv::Point2f emid((ea.x + eb.x) * 0.5f, (ea.y + eb.y) * 0.5f);
+
+                    // If normal points toward centroid, flip it so nx,ny points OUTWARD
+                    double toCx = centroid.x - emid.x, toCy = centroid.y - emid.y;
+                    if (nx * toCx + ny * toCy > 0) { nx = -nx; ny = -ny; }
+
+                    for (auto& dp : dense)
+                    {
+                        double tx = dp.x - ea.x, ty = dp.y - ea.y;
+                        double perp = tx * nx + ty * ny;   // signed: + = outward, - = inward
+                        double proj = tx * edx + ty * edy;
+                        // Collect points in a band: allow up to 4px inward, 20px outward
+                        // This pulls fitLine toward the OUTER edge of the black ink
+                        if (perp >= -4.0 && perp <= 20.0 && proj > -20.0 && proj < elen + 20.0)
+                            pts.push_back(cv::Point2f(dp.x, dp.y));
+                    }
+                    return pts;
+                };
+
+            double ax1, ay1, dx1, dy1, ax2, ay2, dx2, dy2;
+
+            auto fitEdge = [&](cv::Point2f ea, cv::Point2f eb,
+                double& ax, double& ay,
+                double& dx, double& dy)
+                {
+                    auto pts = collectEdgePts(ea, eb);
+                    if ((int)pts.size() < 6)
+                    {
+                        double el = std::hypot(eb.x - ea.x, eb.y - ea.y) + 1e-9;
+                        ax = ea.x;ay = ea.y;dx = (eb.x - ea.x) / el;dy = (eb.y - ea.y) / el;
+                        return;
+                    }
+                    cv::Vec4f lp;
+                    cv::fitLine(pts, lp, cv::DIST_L2, 0, 0.01, 0.01);
+                    ax = lp[2];ay = lp[3];dx = lp[0];dy = lp[1];
+                };
+
+            fitEdge(p0, p1, ax1, ay1, dx1, dy1);
+            fitEdge(p1, p2, ax2, ay2, dx2, dy2);
+
+            double ddx = ax2 - ax1, ddy = ay2 - ay1;
+            double denom = dx1 * dy2 - dy1 * dx2;
+            if (std::abs(denom) < 1e-9)
+                corners.push_back({ p1.x,p1.y });
+            else
+            {
+                double t = (ddx * dy2 - ddy * dx2) / denom;
+                corners.push_back({ ax1 + t * dx1, ay1 + t * dy1 });
+            }
+        }
+        // Measure straightness from the found corners
+        bool isFlatTarget = false;
+        if (corners.size() >= 8)
+        {
+            // Only use the 8 convex hull corners, not the 2 neck corners
+            std::vector<cv::Point2d> convexOnly(corners.begin(), corners.begin() + 8);
+
+            double minX = 1e9, maxX = -1e9;
+            for (auto& c : convexOnly) { minX = std::min(minX, c.x); maxX = std::max(maxX, c.x); }
+
+            std::vector<double> leftXs, rightXs;
+            double width = maxX - minX;
+            for (auto& c : convexOnly)
+            {
+                if (c.x < minX + width * 0.25) leftXs.push_back(c.x);
+                if (c.x > maxX - width * 0.25) rightXs.push_back(c.x);
+            }
+
+            if (leftXs.size() >= 2 && rightXs.size() >= 2)
+            {
+                auto variance = [](const std::vector<double>& v) -> double {
+                    double mean = 0; for (double x : v) mean += x; mean /= v.size();
+                    double var = 0; for (double x : v) var += (x - mean) * (x - mean);
+                    return var / v.size();
+                    };
+
+                double leftVar = variance(leftXs);
+                double rightVar = variance(rightXs);
+
+                std::cout << "  [STRAIGHTNESS] leftVar=" << leftVar
+                    << " rightVar=" << rightVar << "\n";
+
+                // In straightness check — increase variance threshold
+                isFlatTarget = (leftVar < 5000.0 && rightVar < 5000.0);  // was 100.0
+            }
+        }
+
+        // Part 2: Add 2 neck corners via deepest convexity defect
+        // — upgraded to line-fit intersection, same as convex corners
+        std::vector<int> hullIdx;
+        cv::convexHull(dense, hullIdx, false, false);
+        std::vector<cv::Vec4i> defects;
+        cv::convexityDefects(dense, hullIdx, defects);
+
+        if (!defects.empty())
+        {
+            std::cout << "  [DEFECT COUNT] total=" << defects.size() << "\n";
+            std::cout << "  [DENSE SIZE] " << dense.size() << "\n";
+            for (int d = 0; d < std::min(5, (int)defects.size()); d++)
+            {
+                int si = defects[d][0], ei = defects[d][1];
+                int rawDepth = defects[d][3];
+                std::cout << "  [DEFECT PRE-SORT " << d << "] rawdepth=" << rawDepth
+                    << " start=(" << dense[si].x << "," << dense[si].y
+                    << ") end=(" << dense[ei].x << "," << dense[ei].y << ")\n";
+            }
+
+            std::sort(defects.begin(), defects.end(),
+                [](const cv::Vec4i& a, const cv::Vec4i& b)
+                { return a[3] > b[3]; });
+
+            int startIdx = defects[0][0];
+            int endIdx = defects[0][1];
+            int N = (int)dense.size();
+
+            // For each raw neck junction, collect points along the two
+            // edges that meet there and intersect their fitted lines.
+            // Window: look windowW points to each side of the junction.
+            int windowW = 60;
+
+            // Replace the entire upgradeNeckCorner lambda and its calls with just:
+            cv::Point2d neckLeft = { (double)dense[startIdx].x, (double)dense[startIdx].y };
+            cv::Point2d neckRight = { (double)dense[endIdx].x,   (double)dense[endIdx].y };
+
+            corners.push_back(neckLeft);
+            corners.push_back(neckRight);
+
+            std::cout << "  [CORNERS] Neck corners (raw): ("
+                << neckLeft.x << "," << neckLeft.y << ") and ("
+                << neckRight.x << "," << neckRight.y << ")\n";
+
+        }
+
+        std::cout << "  [STRAIGHTNESS] isFlatTarget=" << isFlatTarget << "\n";
+        return { corners, isFlatTarget };
+    }
+}
 // =============================================================================
 // 1. DETECTION FUNCTION
 // =============================================================================
@@ -197,6 +675,9 @@ std::pair<ContourVec, ObjVec> detection(const cv::Mat& img, ThreshMode mode = Th
 
         thresh_healed_outer = outer_mask;
     }
+
+
+
     // ── COLOR-ZONE MASK ───────────────────────────────────────────────────────
     std::vector<cv::Mat> bgr;
     cv::split(img, bgr);
@@ -339,12 +820,13 @@ std::pair<ContourVec, ObjVec> detection(const cv::Mat& img, ThreshMode mode = Th
     double IMG_AREA = (double)img.rows * img.cols;
     double IMG_DIAG = std::sqrt((double)img.rows * img.rows + (double)img.cols * img.cols);
     double MIN_AREA = IMG_AREA * 0.002;
-    double PERIM_LARGE = IMG_DIAG * 0.5;
+    double PERIM_LARGE = IMG_DIAG * 1;
     double SPIKE_MAX_LEN = IMG_DIAG * 0.1;
     int TOLERANCE_PX = static_cast<int>(IMG_DIAG * 0.03);
+    
 
     std::vector<cv::Rect> seen_boxes;
-
+    bool isFlatTarget = false;
     // Iterate through found contours to identify shapes.
     for (const auto& cnt : contours)
     {
@@ -459,166 +941,255 @@ std::pair<ContourVec, ObjVec> detection(const cv::Mat& img, ThreshMode mode = Th
                 {
                     auto& main_s = *std::max_element(smooth_cnts.begin(), smooth_cnts.end(),
                         [](const Contour& a, const Contour& b)
-                        { return cv::contourArea(a) < cv::contourArea(b); });
+                        { return cv::contourArea(a) > cv::contourArea(b); });
 
                     double cur_area = cv::contourArea(cnt);
                     double largest_so_far = 0;
                     for (const auto& uc : unique_contours)
                         largest_so_far = std::max(largest_so_far, cv::contourArea(uc));
 
-                    // 1. Identify which shape this is (determines if we protect the 90-degree corners)
                     bool is_outer_torso = (cur_area >= largest_so_far);
 
-                    // 2. Apply approxPolyDP to BOTH shapes
                     double eps = 0.005 * cv::arcLength(cnt, true);
                     Contour approx;
                     cv::approxPolyDP(cnt, approx, eps, true);
-                    if (!is_outer_torso)
-                    {
-                        // ── DESKEW: simple convex hull only, exit immediately ─────────────
-                        // Deskew only needs a rough shape for octagon corner finding.
-                        // All the noise-removal code below is for final detection only.
-                        if (mode == ThreshMode::DESKEW)
-                        {
+                    
+
+
+                    if (mode == ThreshMode::DESKEW) {
+                        if (!is_outer_torso) {
+                            // Deskew only needs rough shape — keep existing fast path
                             Contour ch;
                             cv::convexHull(cnt, ch);
                             double eps = 0.01 * cv::arcLength(ch, true);
                             cv::approxPolyDP(ch, contour_to_add, eps, true);
                         }
-                        else
-                        {
-                            // ── DETECTION: robust octagon recovery ────────────────────────
-                            Contour ch;
-                            cv::convexHull(cnt, ch);
-                            double hull_perim = cv::arcLength(ch, true);
+                        else {
+                            // Standard path: Spike removal for Torso or standard detection
+                            cv::Rect xb = cv::boundingRect(main_s);
+                            double x_box = xb.x, y_box = xb.y;
+                            double w_box = xb.width, h_box = xb.height;
 
-                            Contour best_approx;
-                            int best_diff = 9999;
-                            for (double ef = 0.005; ef <= 0.04; ef += 0.002)
+                            int idx = 0;
+                            while (idx < (int)approx.size() && (int)approx.size() > 4)
                             {
-                                Contour trial;
-                                cv::approxPolyDP(ch, trial, ef * hull_perim, true);
-                                int diff = std::abs((int)trial.size() - 8);
-                                if (diff < best_diff)
-                                {
-                                    best_diff = diff;
-                                    best_approx = trial;
-                                }
-                                if (best_diff == 0)
-                                    break;
-                            }
+                                cv::Point2f pc = approx[idx];
+                                cv::Point2f pp = approx[(idx - 1 + (int)approx.size()) % (int)approx.size()];
+                                cv::Point2f pn = approx[(idx + 1) % (int)approx.size()];
 
-                            auto signed_area = [](const Contour& poly) -> double
+                                double lp = ptNorm(pc, pp);
+                                double ln = ptNorm(pc, pn);
+
+                                if (lp < SPIKE_MAX_LEN && ln < SPIKE_MAX_LEN)
                                 {
-                                    double a = 0;
-                                    int n = (int)poly.size();
-                                    for (int i = 0; i < n; i++)
+                                    double v1x = pp.x - pc.x, v1y = pp.y - pc.y;
+                                    double v2x = pn.x - pc.x, v2y = pn.y - pc.y;
+                                    double dot = v1x * v2x + v1y * v2y;
+                                    double n1 = vecNorm(v1x, v1y);
+                                    double n2 = vecNorm(v2x, v2y);
+                                    double cos_a = std::max(-1.0, std::min(1.0, dot / (n1 * n2 + 1e-6)));
+                                    double angle = std::acos(cos_a) * 180.0 / CV_PI;
+
+                                    bool protect = false;
+                                    if (is_outer_torso)
                                     {
-                                        const cv::Point& p1 = poly[i];
-                                        const cv::Point& p2 = poly[(i + 1) % n];
-                                        a += (double)p1.x * p2.y - (double)p2.x * p1.y;
+                                        bool upper = (pc.y < y_box + h_box * 0.40);
+                                        bool head = (pc.y < y_box + h_box * 0.25 &&
+                                            pc.x > x_box + w_box * 0.35 &&
+                                            pc.x < x_box + w_box * 0.65);
+                                        bool shoulder = (pc.y < y_box + h_box * 0.40 &&
+                                            (pc.x < x_box + w_box * 0.30 ||
+                                                pc.x > x_box + w_box * 0.70));
+                                        protect = upper || head || shoulder;
                                     }
-                                    return a * 0.5;
-                                };
 
-                            Contour approx = best_approx;
-                            bool changed = true;
-                            while (changed && (int)approx.size() > 8)
-                            {
-                                changed = false;
-                                int sz = (int)approx.size();
-                                double perim_now = cv::arcLength(approx, true);
-                                double side_thresh = perim_now * 0.12;
-                                double base_area = std::abs(signed_area(approx));
-                                int worst_idx = -1;
-                                double worst_score = -1.0;
-
-                                for (int i = 0; i < sz; i++)
-                                {
-                                    cv::Point2f pc = approx[i];
-                                    cv::Point2f pp = approx[(i - 1 + sz) % sz];
-                                    cv::Point2f pn = approx[(i + 1) % sz];
-                                    double lp = ptNorm(pc, pp);
-                                    double ln = ptNorm(pc, pn);
-                                    if (lp >= side_thresh || ln >= side_thresh)
-                                        continue;
-                                    Contour trial = approx;
-                                    trial.erase(trial.begin() + i);
-                                    double trial_area = std::abs(signed_area(trial));
-                                    if (trial_area < base_area * 0.998)
-                                        continue;
-                                    double score = 1.0 / (lp + ln + 1e-6);
-                                    if (score > worst_score)
+                                    if (angle < 115 && !protect)
                                     {
-                                        worst_score = score;
-                                        worst_idx = i;
+                                        approx.erase(approx.begin() + idx);
+                                        continue;
                                     }
                                 }
-                                if (worst_idx >= 0)
-                                {
-                                    approx.erase(approx.begin() + worst_idx);
-                                    changed = true;
-                                }
+                                idx++;
                             }
-
-                            if ((int)approx.size() < 6)
-                            {
-                                cv::approxPolyDP(ch, approx, 0.015 * hull_perim, true);
-                            }
-
                             contour_to_add = approx;
                         }
                     }
-                    else
-                    {
-                        // Standard path: Spike removal for Torso or standard detection
-                        cv::Rect xb = cv::boundingRect(main_s);
-                        double x_box = xb.x, y_box = xb.y;
-                        double w_box = xb.width, h_box = xb.height;
+                    else {
+                        if (!is_outer_torso) {
+                            Contour dense = densifyContour(cnt, 2.0);
 
-                        int idx = 0;
-                        while (idx < (int)approx.size() && (int)approx.size() > 4)
-                        {
-                            cv::Point2f pc = approx[idx];
-                            cv::Point2f pp = approx[(idx - 1 + (int)approx.size()) % (int)approx.size()];
-                            cv::Point2f pn = approx[(idx + 1) % (int)approx.size()];
+                            auto [trueCorners, dummy] = findTrueCorners(dense, true);         // octagon
+                            std::cout << "  [CORNERS] Found Octagon ==>" << trueCorners.size() << " true corners\n";
 
-                            double lp = ptNorm(pc, pp);
-                            double ln = ptNorm(pc, pn);
+                            // Mark contour points near any true corner as protected
+                            std::vector<bool> protected_(dense.size(), false);
+                            double protectRadius = 50.0; // px radius around each corner to protect
 
-                            if (lp < SPIKE_MAX_LEN && ln < SPIKE_MAX_LEN)
+                            for (int i = 0; i < (int)dense.size(); i++)
                             {
-                                double v1x = pp.x - pc.x, v1y = pp.y - pc.y;
-                                double v2x = pn.x - pc.x, v2y = pn.y - pc.y;
-                                double dot = v1x * v2x + v1y * v2y;
-                                double n1 = vecNorm(v1x, v1y);
-                                double n2 = vecNorm(v2x, v2y);
-                                double cos_a = std::max(-1.0, std::min(1.0, dot / (n1 * n2 + 1e-6)));
-                                double angle = std::acos(cos_a) * 180.0 / CV_PI;
-
-                                bool protect = false;
-                                if (is_outer_torso)
+                                for (auto& c : trueCorners)
                                 {
-                                    bool upper = (pc.y < y_box + h_box * 0.40);
-                                    bool head = (pc.y < y_box + h_box * 0.25 &&
-                                        pc.x > x_box + w_box * 0.35 &&
-                                        pc.x < x_box + w_box * 0.65);
-                                    bool shoulder = (pc.y < y_box + h_box * 0.40 &&
-                                        (pc.x < x_box + w_box * 0.30 ||
-                                            pc.x > x_box + w_box * 0.70));
-                                    protect = upper || head || shoulder;
-                                }
-
-                                if (angle < 115 && !protect)
-                                {
-                                    approx.erase(approx.begin() + idx);
-                                    continue;
+                                    double dist = std::hypot(dense[i].x - c.x, dense[i].y - c.y);
+                                    if (dist < protectRadius)
+                                    {
+                                        protected_[i] = true;
+                                        break;
+                                    }
                                 }
                             }
-                            idx++;
+                            cv::Rect bb = cv::boundingRect(dense);
+                            std::cout << "  [OCTAGON BB] x=" << bb.x << " y=" << bb.y
+                                << " w=" << bb.width << " h=" << bb.height << "\n";
+                            // Pass protected_ into removeBulletHoles
+                            // After removeBulletHoles:
+                            // Detect horseshoe: check if contour self-intersects at the top
+                            auto detectHorseshoe = [&](const Contour& cnt) -> bool
+                                {
+                                    cv::Rect bb = cv::boundingRect(cnt);
+                                    double topThreshold = bb.y + bb.height * 0.35;
+
+                                    // Collect X coordinates of points in top region in contour order
+                                    std::vector<double> topXs;
+                                    for (auto& p : cnt)
+                                        if (p.y < topThreshold)
+                                            topXs.push_back(p.x);
+
+                                    if (topXs.size() < 10) return false;
+
+                                    // Find the maximum X drop followed by rise in the sequence
+                                    // A normal octagon top goes left-to-right (or right-to-left) monotonically
+                                    // A horseshoe goes one direction, drops back, then continues — big reversal
+                                    double maxReversal = 0;
+                                    double runningMax = topXs[0];
+                                    double runningMin = topXs[0];
+
+                                    for (int i = 1; i < (int)topXs.size(); i++)
+                                    {
+                                        runningMax = std::max(runningMax, topXs[i]);
+                                        runningMin = std::min(runningMin, topXs[i]);
+                                    }
+                                    double totalRange = runningMax - runningMin;
+
+                                    // Check for direction reversals — count times X changes direction significantly
+                                    int reversals = 0;
+                                    double prevDx = 0;
+                                    for (int i = 1; i < (int)topXs.size(); i++)
+                                    {
+                                        double dx = topXs[i] - topXs[i - 1];
+                                        if (std::abs(dx) < 2.0) continue; // ignore tiny jitter
+                                        if (prevDx != 0 && ((dx > 0) != (prevDx > 0)))
+                                            reversals++;
+                                        prevDx = dx;
+                                    }
+
+                                    std::cout << "  [HORSESHOE] topPts=" << topXs.size()
+                                        << " totalRange=" << totalRange
+                                        << " reversals=" << reversals << "\n";
+
+                                    // A horseshoe has many reversals in the top region
+                                    // A clean octagon top has 1 reversal at most (left diagonal → right diagonal meeting at top)
+                                    return (reversals > 6);
+                                };
+
+                            Contour cntclean = removeBulletHoles(dense, protected_, 60.0, 0.1, 20);
+                            bool isHorseshoe = detectHorseshoe(cntclean);
+                            std::cout << "  [HORSESHOE] detected=" << isHorseshoe << "\n";
+                            std::cout << "[FLATTARGET] is flat target ==" << isFlatTarget << "\n";
+                            Contour baseContour;
+                            if (isHorseshoe || isFlatTarget)
+                            {
+                                std::cout << "USING CONVEX HULL"<< "\n";
+                                for (auto& c : trueCorners)
+                                    baseContour.push_back(cv::Point((int)std::round(c.x), (int)std::round(c.y)));
+                            }
+                            else
+                            {
+                                cv::approxPolyDP(cntclean, baseContour, 0.5, true);
+                            }
+                            
+
+                            // Push every contour point outward by ink thickness
+                            // so all edges sit on the outer black guide line, not the inner edge
+                            cv::Point2d centroidOff(0, 0);
+                            for (auto& p : baseContour) { centroidOff.x += p.x; centroidOff.y += p.y; }
+                            centroidOff.x /= baseContour.size();
+                            centroidOff.y /= baseContour.size();
+
+                            double inkOffset = 4.0; // tune this
+                            Contour cntoffset;
+                            for (int i = 0; i < (int)baseContour.size(); i++)
+                            {
+                                int prev = (i - 1 + (int)baseContour.size()) % (int)baseContour.size();
+                                int next = (i + 1) % (int)baseContour.size();
+
+                                double ex = baseContour[next].x - baseContour[prev].x;
+                                double ey = baseContour[next].y - baseContour[prev].y;
+                                double elen = std::hypot(ex, ey);
+                                if (elen < 1e-6) { cntoffset.push_back(baseContour[i]); continue; }
+
+                                double nx = -ey / elen, ny = ex / elen;
+
+                                // Flip to point away from centroid (outward)
+                                double toCx = centroidOff.x - baseContour[i].x;
+                                double toCy = centroidOff.y - baseContour[i].y;
+                                if (nx * toCx + ny * toCy > 0) { nx = -nx; ny = -ny; }
+
+                                cntoffset.push_back(cv::Point(
+                                    (int)std::round(baseContour[i].x + nx * inkOffset),
+                                    (int)std::round(baseContour[i].y + ny * inkOffset)
+                                ));
+                            }
+
+                            std::cout << "  [BHR] Octagon after approx=" << baseContour.size() << "\n";
+                            contour_to_add = cntoffset;
                         }
-                        contour_to_add = approx;
+                        else {
+                            // Densify first so bullet holes and curves have enough points
+                            Contour dense = densifyContour(cnt, 2.0);  // 1 point every 2px
+
+                            auto [trueCorners, flatFlag] = findTrueCorners(dense, false);
+                            isFlatTarget = flatFlag;
+
+                            std::cout << "  [CORNERS] Found Torso ==>" << trueCorners.size() << " true corners\n";
+                            for (auto& c : trueCorners)
+                                std::cout << "    corner at (" << c.x << ", " << c.y << ")\n";
+
+                            // Mark contour points near any true corner as protected
+                            // Mark contour points near any true corner as protected
+                            std::vector<bool> protected_(dense.size(), false);
+                            double protectRadius = 50.0;  // was 50.0 — increase to protect full corner transitions
+
+                            for (int i = 0; i < (int)dense.size(); i++)
+                            {
+                                for (auto& c : trueCorners)
+                                {
+                                    double dist = std::hypot(dense[i].x - c.x, dense[i].y - c.y);
+                                    if (dist < protectRadius)
+                                    {
+                                        protected_[i] = true;
+                                        break;
+                                    }
+                                }
+
+                                // Also protect any point in the upper 35% of the contour bounding box
+                                // This saves the shoulder-to-neck diagonal edges on both sides
+                                cv::Rect bb = cv::boundingRect(dense);
+                                if (dense[i].y < bb.y + bb.height * 0.35)
+                                    protected_[i] = true;
+                            }
+
+                            // Pass protected_ into removeBulletHoles
+                            Contour cnt_clean = removeBulletHoles(dense, protected_, 50.0, 0.5, 50);
+                            double eps = 0.5;  // fixed 0.5px — not proportional, not aggressive
+                            Contour result;
+                            cv::approxPolyDP(cnt_clean, result, eps, true);
+                            std::cout << "  [BHR]Torso After approx=" << result.size() << "\n";
+
+
+                            contour_to_add = result;
+                        }
                     }
+                    
                 }
             }
             else
@@ -657,7 +1228,7 @@ std::pair<ContourVec, ObjVec> detection(const cv::Mat& img, ThreshMode mode = Th
         unique_contours.push_back(contour_to_add);
         detected_objects.push_back(obj);
     }
-
+    
     // ── Post-loop noise removal ───────────────────────────────────────────────
     if (!unique_contours.empty())
     {
@@ -679,8 +1250,8 @@ std::pair<ContourVec, ObjVec> detection(const cv::Mat& img, ThreshMode mode = Th
 
             double solidity = (hull_area > 0) ? (current_area / hull_area) : 0.0;
 
-            // 2. Apply your filtering logic
-            if (detected_objects[i].area >= min_rel && solidity > 0.70)
+            // 2. Apply filtering logic
+            if (detected_objects[i].area >= min_rel && solidity > 0.40)
             {
                 fc.push_back(unique_contours[i]);
                 fo.push_back(detected_objects[i]);
@@ -689,6 +1260,7 @@ std::pair<ContourVec, ObjVec> detection(const cv::Mat& img, ThreshMode mode = Th
         unique_contours = fc;
         detected_objects = fo;
     }
+    
     // ── Remove inner zones (Second largest shape and Head rectangle for deskew pass) ──
     if (detected_objects.size() >= 2)
     {
@@ -1443,12 +2015,31 @@ cv::Mat deskewing(const cv::Mat& img, double angle_threshold = 10.0)
         if (find_torso_polygon(corrected, cnt_z, approx_z, bbox_z))
         {
             int iw = corrected.cols, ih = corrected.rows;
+
+            // Stage B — existing ratio check PLUS minimum size check
             double area_ratio = (double)(bbox_z.width * bbox_z.height) / (iw * ih);
             std::cout << " | fill=" << area_ratio;
+           
 
-            if (area_ratio < 0.3)
+            // Zoom if target is too small relative to image OR too small in absolute pixels
+            // TARGET_W=850, TARGET_H=1550 is our standard output size
+            // A properly filled target should be at least 60% of output dimensions
+            double target_fill_w = (double)bbox_z.width / iw;
+            double target_fill_h = (double)bbox_z.height / ih;
+            std::cout << " | target_fill_w=" << target_fill_w;
+            std::cout << " | target_fill_h=" << target_fill_h;
+            bool needs_zoom = (area_ratio < 0.7) &&
+                ((target_fill_w < 0.80) ||
+                (target_fill_h < 0.80));
+
+            if (needs_zoom)
             {
-                double SCALE = 1.3;
+                // Compute scale needed to bring target to ~80% of frame
+                double scale_w = (iw * 0.80) / bbox_z.width;
+                double scale_h = (ih * 0.80) / bbox_z.height;
+                double SCALE = std::min(scale_w, scale_h);  // use the limiting dimension
+                SCALE = std::min(SCALE, 3.0);  // cap at 3x to avoid absurd zoom
+
                 int new_w = static_cast<int>(bbox_z.width * SCALE);
                 int new_h = static_cast<int>(bbox_z.height * SCALE);
                 int pc_x = bbox_z.x + bbox_z.width / 2;
@@ -1694,16 +2285,6 @@ cv::Mat deskewing(const cv::Mat& img, double angle_threshold = 10.0)
                 k_used = 1.15;
             }
 
-            /* Safety: skip if expanded corners are wildly outside image
-            bool sane = true;
-            for (const auto& p : expanded) {
-                if (p.x < -corrected.cols * 0.25f || p.x > corrected.cols * 1.25f ||
-                    p.y < -corrected.rows * 0.25f || p.y > corrected.rows * 1.25f) {
-                    sane = false; break;
-                }
-            }
-            if (!sane) { std::cout << "-> Expanded corners unsafe. Stopping."; break; }
-            */
             cv::Mat warped_candidate = warp_from_corners(corrected, expanded);
             if (warped_candidate.cols > corrected.cols * 2 ||
                 warped_candidate.rows > corrected.rows * 2)
